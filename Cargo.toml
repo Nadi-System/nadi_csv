@@ -11,5 +11,5 @@ crate-type = ["cdylib"]
 # make sure you use the same version of nadi_core, your nadi-system is in
 [dependencies]
 abi_stable = "0.11.3"
-nadi_core = {version="0.8.0", path="../nadi-system/nadi_core"}
+nadi_core = {version="0.8.0", path="../nadi-system/nadi_core", features=["chrono"]}
 polars = { version = "0.49.0", features = ["cum_agg", "interpolate", "is_in", "lazy", "temporal"] }
