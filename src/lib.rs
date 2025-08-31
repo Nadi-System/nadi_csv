@@ -5,6 +5,7 @@ mod csv {
     use crate::utils::*;
     use nadi_core::attrs::IntOrStr;
     use nadi_core::prelude::*;
+    use nadi_core::timeseries::TimeSeries;
     use polars::error::ErrString;
     use polars::prelude::*;
     use std::collections::HashMap;
@@ -152,7 +153,7 @@ mod csv {
     ///
     /// ```task,ignore
     /// network csv.load_series("/home/gaurav/work/nadi-project/codes/nadi_csv/test.csv", "test")
-    ///
+    /// ```
     #[network_func(dates = true)]
     fn load_series(
         net: &Network,
@@ -192,14 +193,109 @@ mod csv {
         }
         Ok(())
     }
+
+    /// Load timeseries values to nodes
+    ///
+    /// ```task,ignore
+    /// network csv.load_timeseries("/home/gaurav/work/nadi-project/codes/nadi_csv/test.csv", "date", "test")
+    ///
+    #[network_func(datefmt = "%Y-%m-%d", dates = true)]
+    fn load_timeseries(
+        net: &Network,
+        /// Path to the CSV file
+        path: PathBuf,
+        /// Name of the column with datetime
+        datecol: String,
+        /// Name of the Series
+        name: String,
+        /// Date Format to save the dates
+        datefmt: String,
+        /// HashMap of column name to Node name
+        nodemap: Option<HashMap<String, String>>,
+        /// Parse Dates in the file
+        dates: bool,
+    ) -> Result<(), PolarsError> {
+        let df = LazyCsvReader::new(path)
+            .with_has_header(true)
+            .with_try_parse_dates(dates)
+            .with_infer_schema_length(Some(10))
+            .with_ignore_errors(true)
+            .finish()?;
+        let df: DataFrame = df.collect()?;
+        let timeline = timeline_from_df(&df, &datecol, &datefmt)?;
+        for node in net.nodes() {
+            let mut node = node.lock();
+            let node_name = node.name();
+            let col = match nodemap {
+                // TODO handle this error
+                Some(ref map) => match map.get(node_name) {
+                    Some(n) => df.column(&map[n])?,
+                    None => {
+                        return Err(PolarsError::ColumnNotFound(ErrString::new_static(
+                            "Node Map does not have the node",
+                        )))
+                    }
+                },
+                None => df.column(node_name)?,
+            };
+            let series = polars_col_to_series(col)?;
+            node.set_ts(&name, TimeSeries::new(timeline.clone(), series));
+        }
+        Ok(())
+    }
 }
 
 mod utils {
+    use abi_stable::external_types::RMutex;
+    use abi_stable::std_types::RArc;
     use abi_stable::std_types::{RNone, ROption, RString};
     use nadi_core::attrs::Date;
-    use nadi_core::timeseries::{CompleteSeries, MaskedSeries, Series};
+    use nadi_core::timeseries::{
+        CompleteSeries, MaskedSeries, Series, TimeLine, TimeLineInner, TimeSeries,
+    };
     use polars::error::ErrString;
     use polars::prelude::*;
+
+    pub fn timeline_from_df(
+        df: &DataFrame,
+        date_col: &str,
+        fmt: &str,
+    ) -> Result<TimeLine, PolarsError> {
+        let dates = df
+            .clone()
+            .lazy()
+            .select([col(date_col)
+                .dt()
+                .timestamp(TimeUnit::Milliseconds)
+                .alias("timestamp")])
+            // .select([
+            //     col("timestamp").max().alias("maximum"),
+            //     col("timestamp").min().alias("minimum"),
+            // ])
+            .collect()?;
+
+        let dt_col = dates.column("timestamp")?;
+        let start = dt_col.min_reduce()?.value().try_extract::<i64>()?;
+        let end = dt_col.max_reduce()?.value().try_extract::<i64>()?;
+        let step = (end - start) / dt_col.len() as i64;
+
+        let dates = df
+            .clone()
+            .lazy()
+            .select([col(date_col).dt().strftime(fmt)])
+            .collect()?;
+        let dt_col = dates.column(date_col)?;
+        let dates: Vec<&str> = dt_col.str()?.into_no_null_iter().collect();
+        let timeline = TimeLineInner::new(
+            start,
+            end,
+            step,
+            true,
+            dates.into_iter().map(String::from).collect(),
+            fmt,
+        );
+        Ok(RArc::new(RMutex::new(timeline)))
+    }
 
     pub fn polars_col_to_series(col: &Column) -> Result<Series, PolarsError> {
         Ok(match col.dtype() {
