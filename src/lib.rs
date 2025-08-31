@@ -3,6 +3,7 @@ use nadi_core::nadi_plugin::nadi_plugin;
 #[nadi_plugin]
 mod csv {
     use crate::utils::*;
+    use nadi_core::attrs::IntOrStr;
     use nadi_core::prelude::*;
     use polars::error::ErrString;
     use polars::prelude::*;
@@ -47,10 +48,12 @@ mod csv {
         node: &mut NodeInner,
         /// Path to the CSV file
         path: PathBuf,
-        /// Name of the column to load
-        name: String,
+        /// Name or Index of the column to load
+        column: IntOrStr,
         /// Parse Dates in the file
         dates: bool,
+        /// Name of the series defaults to column name
+        name: Option<String>,
     ) -> Result<(), PolarsError> {
         let df = LazyCsvReader::new(path)
             .with_has_header(true)
@@ -58,13 +61,84 @@ mod csv {
             .with_infer_schema_length(Some(10))
             .with_ignore_errors(true)
             .finish()?;
-        // let ind = name.and_then(|n| df.get_column_index(&n)).unwrap_or(0);
-        let df: DataFrame = df.select([col(&name)]).collect()?;
+        let sel = match column {
+            IntOrStr::Integer(i) => nth(i),
+            IntOrStr::String(ref s) => col(s.as_str()),
+        };
+        let df: DataFrame = df.select([sel]).collect()?;
         let col = df
             .select_at_idx(0)
             .expect("Should have at least one column");
         let ser = polars_col_to_series(col)?;
+        let name = name.unwrap_or_else(|| match column {
+            IntOrStr::Integer(_) => col.name().to_string(),
+            IntOrStr::String(s) => s.to_string(),
+        });
         node.set_series(&name, ser);
+        Ok(())
+    }
+
+    /// Count the number of data in a column from a CSV file
+    ///
+    /// Returns the number of valid data and the number of total rows
+    #[env_func]
+    fn count_data(
+        /// Path to the CSV file
+        path: PathBuf,
+        /// Name or Index of the column to load
+        column: IntOrStr,
+    ) -> Result<(usize, usize), PolarsError> {
+        let df = LazyCsvReader::new(path)
+            .with_has_header(true)
+            .with_infer_schema_length(Some(10))
+            .with_ignore_errors(true)
+            .finish()?;
+        let sel = match column {
+            IntOrStr::Integer(i) => nth(i),
+            IntOrStr::String(ref s) => col(s.as_str()),
+        };
+        let df: DataFrame = df.select([sel]).collect()?;
+        let col = df
+            .select_at_idx(0)
+            .expect("Should have at least one column");
+        let len = col.len();
+        let nulls = col.null_count();
+        Ok((len - nulls, len))
+    }
+
+    /// Count the number of data in a column from a CSV file
+    ///
+    /// Returns the number of total rows and the number of valid data
+    #[env_func]
+    fn count_usgs_years(
+        /// Path to the CSV file
+        path: PathBuf,
+        /// Output CSV file
+        outfile: PathBuf,
+        /// year dam affected
+        year: Option<i64>,
+    ) -> Result<(), PolarsError> {
+        let df = LazyCsvReader::new(path)
+            .with_has_header(false)
+            .with_try_parse_dates(true)
+            .with_infer_schema_length(Some(10))
+            .with_ignore_errors(true)
+            .finish()?;
+        let df = df
+            .select([nth(0), nth(1).is_not_null().alias("data")])
+            .group_by([nth(0).dt().year().alias("year")])
+            .agg([sum("data")])
+            .sort(["year"], Default::default());
+        let mut df: DataFrame = if let Some(yr) = year {
+            df.with_column(
+                ternary_expr(col("year").lt(yr), lit("pre"), lit("post")).alias("category"),
+            )
+        } else {
+            df.with_column(lit("unknown").alias("category"))
+        }
+        .collect()?;
+        let mut file = std::fs::File::create(outfile).unwrap();
+        CsvWriter::new(&mut file).finish(&mut df)?;
         Ok(())
     }
 
